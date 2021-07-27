@@ -63,6 +63,7 @@ class Symbols
       static const char* Sips;
       static const char* Tel;
       static const char* Pres;
+      static const char* Urn;
       
       static const char* Phone;
       static const char* Isub;
