@@ -105,6 +105,7 @@ BaseCreator::makeInitialRequest(const NameAddr& target, const NameAddr& from, Me
       {
          contact.uri() = mUserProfile->getOverrideHostAndPort();
       }
+      contact.uri().scheme() = from.uri().scheme();
       contact.uri().user() = from.uri().user();
 
       // .jjg. there isn't anything in the outbound [11] draft that says we 
