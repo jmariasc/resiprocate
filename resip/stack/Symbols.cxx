@@ -62,6 +62,7 @@ const char* Symbols::Sip = "sip";
 const char* Symbols::Sips = "sips";
 const char* Symbols::Tel = "tel";
 const char* Symbols::Pres = "pres";
+const char* Symbols::Urn = "urn";
 
 const char* Symbols::Phone = "phone";
 const char* Symbols::Isub = "isub=";

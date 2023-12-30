@@ -162,6 +162,7 @@ class Uri : public ParserCategory
       /** Modifies the default URI encoding character sets */
       static void setUriUserEncoding(unsigned char c, bool encode);
       static void setUriPasswordEncoding(unsigned char c, bool encode);
+      static void setUriUrnEncoding(unsigned char c, bool encode);
       
       bool hasEmbedded() const;
       SipMessage& embedded();
@@ -206,6 +207,19 @@ class Uri : public ParserCategory
                               "0123456789"
                               "-_.!~*\\()&=+$").flip());
          return passwordEncodingTable;
+      }
+
+      static EncodingTable& getUrnEncodingTable()
+      {
+         // Wide encoding table for NID and NSS syntax
+         // https://tools.ietf.org/html/rfc2141#section-2
+         // https://tools.ietf.org/html/rfc8141#appendix-B
+         static EncodingTable urnEncodingTable(
+               Data::toBitset("abcdefghijklmnopqrstuvwxyz"
+                              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                              "0123456789"
+                              "()+,-.:=@;$_!*'/?#~&").flip());
+         return urnEncodingTable;
       }
 
       static EncodingTable& getLocalNumberTable()

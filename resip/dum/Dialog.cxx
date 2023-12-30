@@ -97,7 +97,8 @@ Dialog::Dialog(DialogUsageManager& dum, const SipMessage& msg, DialogSet& ds)
             {
                const NameAddr& contact = request.header(h_Contacts).front();
                if (isEqualNoCase(contact.uri().scheme(), Symbols::Sips) ||
-                   isEqualNoCase(contact.uri().scheme(), Symbols::Sip))
+                   isEqualNoCase(contact.uri().scheme(), Symbols::Sip) ||
+                   isEqualNoCase(contact.uri().scheme(), Symbols::Urn))
                {
                   // Store Remote Target
                   mRemoteTarget = contact;
@@ -121,13 +122,18 @@ Dialog::Dialog(DialogUsageManager& dum, const SipMessage& msg, DialogSet& ds)
                      {
                         mLocalContact.uri() = mDialogSet.mUserProfile->getOverrideHostAndPort();
                      }
-                     if(request.header(h_RequestLine).uri().user().empty())
+                     if (mLocalContact.uri().user().empty())
                      {
-                        mLocalContact.uri().user() = request.header(h_To).uri().user(); 
-                     }
-                     else
-                     {
-                        mLocalContact.uri().user() = request.header(h_RequestLine).uri().user(); 
+                        if(request.header(h_RequestLine).uri().user().empty())
+                        {
+                           mLocalContact.uri().scheme() = request.header(h_To).uri().scheme(); 
+                           mLocalContact.uri().user() = request.header(h_To).uri().user(); 
+                        }
+                        else
+                        {
+                           mLocalContact.uri().scheme() = request.header(h_RequestLine).uri().scheme(); 
+                           mLocalContact.uri().user() = request.header(h_RequestLine).uri().user(); 
+                        }
                      }
                      const Data& instanceId = mDialogSet.mUserProfile->getInstanceId();
                      if (!contact.uri().exists(p_gr) && !instanceId.empty())
@@ -221,7 +227,8 @@ Dialog::Dialog(DialogUsageManager& dum, const SipMessage& msg, DialogSet& ds)
                {
                   const NameAddr& contact = response.header(h_Contacts).front();
                   if (isEqualNoCase(contact.uri().scheme(), Symbols::Sips) ||
-                     isEqualNoCase(contact.uri().scheme(), Symbols::Sip))
+                     isEqualNoCase(contact.uri().scheme(), Symbols::Sip) ||
+                     isEqualNoCase(contact.uri().scheme(), Symbols::Urn))
                   {
                      BaseCreator* creator = mDialogSet.getCreator();
                      if(0 == creator)

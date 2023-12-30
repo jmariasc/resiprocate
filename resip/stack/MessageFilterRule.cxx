@@ -90,10 +90,10 @@ MessageFilterRule::matches(const SipMessage &msg) const
 bool
 MessageFilterRule::schemeIsInList(const Data& scheme) const
 {
-   // Emtpy list means "sip or sips"
+   // Emtpy list means "sip or sips or urn"
    if (mSchemeList.empty())
    {
-      return (scheme == Symbols::Sip || scheme == Symbols::Sips || scheme == Symbols::Tel);
+      return (scheme == Symbols::Sip || scheme == Symbols::Sips || scheme == Symbols::Tel || scheme == Symbols::Urn);
    }
 
    // step through mSchemeList looking for supported schemes

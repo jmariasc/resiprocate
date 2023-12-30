@@ -26,6 +26,7 @@ static bool initAllTables()
 {
    Uri::getUserEncodingTable();
    Uri::getPasswordEncodingTable();
+   Uri::getUrnEncodingTable();
    Uri::getLocalNumberTable();
    Uri::getGlobalNumberTable();
    return true;
@@ -452,7 +453,7 @@ Uri::operator==(const Uri& other) const
    }
    
    if (isEqualNoCase(mScheme, other.mScheme) &&
-       ((isEqualNoCase(mScheme, Symbols::Sip) || isEqualNoCase(mScheme, Symbols::Sips)) ? mUser == other.mUser : isEqualNoCase(mUser, other.mUser)) &&
+       ((isEqualNoCase(mScheme, Symbols::Sip) || isEqualNoCase(mScheme, Symbols::Sips) || isEqualNoCase(mScheme, Symbols::Urn)) ? mUser == other.mUser : isEqualNoCase(mUser, other.mUser)) &&
        isEqualNoCase(mUserParameters,other.mUserParameters) &&
        mPassword == other.mPassword &&
        mPort == other.mPort &&
@@ -820,6 +821,22 @@ Uri::getAorInternal(bool dropScheme, bool addPort, Data& aor) const
       aor += ':';
    }
 
+   if (isEqualNoCase(mScheme, Symbols::Urn))
+   {
+      if (!mUser.empty())
+      {
+#ifdef HANDLE_CHARACTER_ESCAPING
+         {
+            oDataStream str(aor);
+            mUser.escapeToStream(str, getUrnEncodingTable()); 
+         }
+#else
+         aor << mUser;
+#endif
+      }
+      return;
+   }
+
    if (!mUser.empty())
    {
 #ifdef HANDLE_CHARACTER_ESCAPING
@@ -1035,6 +1052,19 @@ Uri::parse(ParseBuffer& pb)
       return;
    }
    
+   if (isEqualNoCase(mScheme, Symbols::Urn))
+   {
+      const char* anchor = pb.position();
+      static std::bitset<256> delimiter=Data::toBitset("\r\n\t ;>");
+      pb.skipToOneOf(delimiter);
+#ifdef HANDLE_CHARACTER_ESCAPING
+      pb.dataUnescaped(mUser, anchor);
+#else
+      pb.data(mUser, anchor);
+#endif
+      return;
+   }
+   
    start = pb.position();
    static std::bitset<256> userPortOrPasswordDelim(Data::toBitset("@:\""));
    // stop at double-quote to prevent matching an '@' in a quoted string param. 
@@ -1170,6 +1200,11 @@ void Uri::setUriPasswordEncoding(unsigned char c, bool encode)
    getPasswordEncodingTable()[c] = encode;
 }
 
+void Uri::setUriUrnEncoding(unsigned char c, bool encode)
+{
+   getUrnEncodingTable()[c] = encode;
+}
+
 // should not encode user parameters unless its a tel?
 EncodeStream& 
 Uri::encodeParsed(EncodeStream& str) const
@@ -1178,6 +1213,19 @@ Uri::encodeParsed(EncodeStream& str) const
    if (!mScheme.empty())
    {
       str << mScheme << Symbols::COLON;
+   }
+
+   if (isEqualNoCase(mScheme, Symbols::Urn))
+   {
+      if (!mUser.empty())
+      {
+#ifdef HANDLE_CHARACTER_ESCAPING
+         mUser.escapeToStream(str, getUrnEncodingTable()); 
+#else
+         str << mUser;
+#endif
+      }
+      return str;
    }
 
    if (!mUser.empty())
