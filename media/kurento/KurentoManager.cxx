@@ -1,14 +1,13 @@
 
+#include <boost/asio/ssl/context.hpp>
+
 #include "rutil/Logger.hxx"
 
 #include "KurentoManager.hxx"
 #include "KurentoConnection.hxx"
 #include "KurentoSubsystem.hxx"
 
-#include <websocketpp/config/asio_no_tls_client.hpp>
-#include <websocketpp/client.hpp>
-
-typedef websocketpp::client<websocketpp::config::asio_client> client;
+namespace ssl = boost::asio::ssl;
 
 using namespace kurento;
 
@@ -16,9 +15,18 @@ using namespace kurento;
 
 KurentoManager::KurentoManager(std::chrono::milliseconds timeout, std::chrono::milliseconds retryInterval)
    : mTimeout(timeout),
-     mRetryInterval(retryInterval)
+     mRetryInterval(retryInterval),
+     mSslCtx(ssl::context::tls_client)
 {
-   mWSClient.init_asio(&mAsio);
+   // Certificate verification is enabled by default (verify_peer + the
+   // system's default CA paths). If the target KMS uses a self-signed
+   // certificate (common in test/development deployments), the caller needs
+   // to decide explicitly what to do:
+   //   - load its CA explicitly: mSslCtx.load_verify_file("ca.pem");
+   //   - or relax this to ssl::verify_none.
+   // Neither is done here by default, to avoid silently weakening security.
+   mSslCtx.set_verify_mode(ssl::verify_peer);
+   mSslCtx.set_default_verify_paths();
 }
 
 KurentoManager::~KurentoManager()
@@ -29,16 +37,24 @@ KurentoManager::~KurentoManager()
 void
 KurentoManager::process()
 {
-   mAsio.poll();
+   mIoc.poll();
 }
 
 KurentoConnection::ptr
 KurentoManager::getKurentoConnection(const std::string& uri, KurentoConnectionObserver& observer)
 {
-   KurentoConnection::ptr kConnection = std::make_shared<KurentoConnection>(observer, uri, mWSClient, mTimeout, mRetryInterval);
+   KurentoConnection::ptr kConnection = std::make_shared<KurentoConnection>(observer, uri, mIoc, mSslCtx, mTimeout, mRetryInterval);
+
+   // This map was previously declared but never populated (dead code). It
+   // is now populated here; this costs nothing and avoids connections being
+   // referenced only from outside this class. It does not change any
+   // observable behaviour.
+   mConnections[uri] = kConnection;
 
    // Note that connect here only requests a connection. No network messages are
-   // exchanged until the event loop starts running in the next line.
+   // exchanged until the event loop starts running (KurentoManager::process(),
+   // which the caller is expected to invoke regularly) and drains the pending
+   // operations on mIoc.
    kConnection->onRetryRequired();
 
    return kConnection;

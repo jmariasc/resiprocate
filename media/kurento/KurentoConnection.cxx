@@ -1,4 +1,9 @@
 
+#include <openssl/ssl.h>
+
+#include <boost/asio/connect.hpp>
+#include <boost/beast/core/buffers_to_string.hpp>
+
 #include "cajun/json/writer.h"
 
 #include "rutil/Logger.hxx"
@@ -7,6 +12,11 @@
 #include "KurentoConnection.hxx"
 #include "KurentoSubsystem.hxx"
 #include "Object.hxx"
+
+namespace net = boost::asio;
+namespace ssl = boost::asio::ssl;
+namespace websocket = boost::beast::websocket;
+using tcp = boost::asio::ip::tcp;
 
 using namespace kurento;
 using namespace resip;
@@ -19,102 +29,238 @@ KurentoConnectionObserver::~KurentoConnectionObserver()
 {
 }
 
-KurentoConnection::KurentoConnection(KurentoConnectionObserver& observer, std::string uri, kurento::client& wSClient, std::chrono::milliseconds timeout, std::chrono::milliseconds retryInterval, bool waitForResponse)
+//-----------------------------------------------------------------------------
+KurentoConnection::ParsedUri
+KurentoConnection::parseUri(const std::string& uri)
+{
+   ParsedUri result;
+   std::string rest = uri;
+
+   if (rest.rfind("wss://", 0) == 0)
+   {
+      result.secure = true;
+      rest = rest.substr(6);
+   }
+   else if (rest.rfind("ws://", 0) == 0)
+   {
+      result.secure = false;
+      rest = rest.substr(5);
+   }
+   else
+   {
+      // No explicit scheme: default to non-secure, matching the behaviour of
+      // the previous websocketpp::client<asio_client>-based implementation
+      // (which only ever spoke ws://).
+      result.secure = false;
+   }
+
+   const std::string::size_type slashPos = rest.find('/');
+   const std::string hostPort = (slashPos == std::string::npos) ? rest : rest.substr(0, slashPos);
+   result.target = (slashPos == std::string::npos) ? "/" : rest.substr(slashPos);
+
+   const std::string::size_type colonPos = hostPort.find(':');
+   if (colonPos == std::string::npos)
+   {
+      result.host = hostPort;
+      result.port = result.secure ? "443" : "80";
+   }
+   else
+   {
+      result.host = hostPort.substr(0, colonPos);
+      result.port = hostPort.substr(colonPos + 1);
+   }
+
+   return result;
+}
+//-----------------------------------------------------------------------------
+KurentoConnection::KurentoConnection(KurentoConnectionObserver& observer, std::string uri,
+                                     net::io_context& ioc, ssl::context& sslCtx,
+                                     std::chrono::milliseconds timeout, std::chrono::milliseconds retryInterval,
+                                     bool waitForResponse)
    : mObserver(observer),
+     mParsedUri(parseUri(uri)),
      mUri(uri),
-     mWSClient(wSClient),
+     mIoc(ioc),
+     mSslCtx(sslCtx),
+     mResolver(ioc),
+     mRetryTimer(ioc),
      mTimeout(timeout),  // FIXME - we don't use mTimeout yet
      mRetryInterval(retryInterval),
      mWaitForResponse(waitForResponse)
 {
-
 }
-
+//-----------------------------------------------------------------------------
 KurentoConnection::~KurentoConnection()
 {
-   // FIXME
+   // FIXME (unchanged from the original: no explicit shutdown is performed
+   // here; see close() for a deliberate shutdown, which callers may want to
+   // invoke from their own teardown path)
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::onRetryRequired()
 {
-   InfoLog(<<"trying to open connection to Kurento");
-   websocketpp::lib::error_code ec;
-   client::connection_ptr con = mWSClient.get_connection(mUri, ec);
-   if (ec) {
-      ErrLog(<< "could not create connection because: " << ec.message());
-      resip_assert(0); // FIXME
+   InfoLog(<<"trying to open connection to Kurento: " << mUri);
+
+   mWsPlain  = boost::none;
+   mWsSecure = boost::none;
+   mConnected     = false;
+   mWriteInProgress = false;
+
+   // boost::optional::emplace() constructs the stream directly inside the
+   // optional's storage (no copy/move of the stream is required).
+   if (mParsedUri.secure)
+   {
+      mWsSecure.emplace(mIoc, mSslCtx);
+
+      // SNI - required for many TLS servers (including reverse proxies in
+      // front of KMS) to serve the correct certificate.
+      if (!SSL_set_tlsext_host_name(mWsSecure->next_layer().native_handle(), mParsedUri.host.c_str()))
+      {
+         boost::system::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
+         ErrLog(<<"failed to set SNI hostname: " << ec.message());
+      }
+   }
+   else
+   {
+      mWsPlain.emplace(mIoc);
    }
 
-   mHandle = con->get_handle();
-
-   con->set_open_handler(websocketpp::lib::bind(
-            &KurentoConnection::onOpen,
-            this,
-            &mWSClient,
-            websocketpp::lib::placeholders::_1
-   ));
-   con->set_fail_handler(websocketpp::lib::bind(
-            &KurentoConnection::onFail,
-            this,
-            &mWSClient,
-            websocketpp::lib::placeholders::_1
-   ));
-   con->set_close_handler(websocketpp::lib::bind(
-            &KurentoConnection::onClose,
-            this,
-            &mWSClient,
-            websocketpp::lib::placeholders::_1
-   ));
-   con->set_message_handler(websocketpp::lib::bind(
-            &KurentoConnection::onMessage,
-            this,
-            &mWSClient,
-            websocketpp::lib::placeholders::_1,
-            websocketpp::lib::placeholders::_2
-   ));
-
-   mWSClient.connect(con);
+   doResolve();
 }
-
+//-----------------------------------------------------------------------------
 void
-KurentoConnection::onOpen(client* wSClient, websocketpp::connection_hdl h)
+KurentoConnection::doResolve()
 {
+   auto self = shared_from_this();
+   mResolver.async_resolve(mParsedUri.host, mParsedUri.port,
+      [self](boost::system::error_code ec, tcp::resolver::results_type results)
+      {
+         self->onResolve(ec, results);
+      });
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onResolve(boost::system::error_code ec, tcp::resolver::results_type results)
+{
+   if (ec)
+   {
+      handleTransportError(ec, "resolve");
+      return;
+   }
+
+   auto self = shared_from_this();
+   auto onConnectCb = [self](boost::system::error_code ec2, tcp::resolver::results_type::endpoint_type ep)
+   {
+      self->onConnect(ec2, ep);
+   };
+
+   if (mParsedUri.secure)
+      net::async_connect(mWsSecure->next_layer().next_layer(), results, onConnectCb);
+   else
+      net::async_connect(mWsPlain->next_layer(), results, onConnectCb);
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onConnect(boost::system::error_code ec, tcp::resolver::results_type::endpoint_type ep)
+{
+   if (ec)
+   {
+      handleTransportError(ec, "connect");
+      return;
+   }
+
+   if (mParsedUri.secure)
+   {
+      auto self = shared_from_this();
+      mWsSecure->next_layer().async_handshake(ssl::stream_base::client,
+         [self](boost::system::error_code ec2) { self->onSslHandshake(ec2); });
+   }
+   else
+   {
+      onTransportReady();
+   }
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onSslHandshake(boost::system::error_code ec)
+{
+   if (ec)
+   {
+      handleTransportError(ec, "TLS handshake");
+      return;
+   }
+   onTransportReady();
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onTransportReady()
+{
+   auto self = shared_from_this();
+   auto cb = [self](boost::system::error_code ec) { self->onWsHandshake(ec); };
+
+   if (mParsedUri.secure)
+      mWsSecure->async_handshake(mParsedUri.host, mParsedUri.target, cb);
+   else
+      mWsPlain->async_handshake(mParsedUri.host, mParsedUri.target, cb);
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onWsHandshake(boost::system::error_code ec)
+{
+   if (ec)
+   {
+      handleTransportError(ec, "websocket handshake");
+      return;
+   }
+
    InfoLog(<<"onOpen");
-   mHandle = h;
+   mConnected = true;
    mObserver.onConnected();
+   doRead();
    processSendQueue();
 }
-
+//-----------------------------------------------------------------------------
 void
-KurentoConnection::onFail(client* wSClient, websocketpp::connection_hdl h)
+KurentoConnection::doRead()
 {
-   ErrLog(<<"connection attempt failed, will retry after " << mRetryInterval.count() << " ms");
-   wSClient->set_timer(mRetryInterval.count(), [this](websocketpp::lib::error_code ec){onRetryRequired();});
+   auto self = shared_from_this();
+   auto cb = [self](boost::system::error_code ec, std::size_t n) { self->onRead(ec, n); };
+
+   if (mParsedUri.secure)
+      mWsSecure->async_read(mReadBuffer, cb);
+   else
+      mWsPlain->async_read(mReadBuffer, cb);
 }
-
+//-----------------------------------------------------------------------------
 void
-KurentoConnection::onClose(client* wSClient, websocketpp::connection_hdl h)
+KurentoConnection::onRead(boost::system::error_code ec, std::size_t bytesTransferred)
 {
-   InfoLog(<<"onClose");
-   if(!mRunning)
+   if (ec)
    {
+      handleTransportError(ec, "read");
       return;
    }
-   ErrLog(<<"connection closed unexpectedly, will try to reopen it");
-   wSClient->set_timer(mRetryInterval.count(), [this](websocketpp::lib::error_code ec){onRetryRequired();});
-}
 
-void
-KurentoConnection::onMessage(client* wSClient, websocketpp::connection_hdl h, client::message_ptr msg)
-{
-   if (msg->get_opcode() != websocketpp::frame::opcode::text)
+   const bool isText = mParsedUri.secure ? mWsSecure->got_text() : mWsPlain->got_text();
+   if (!isText)
    {
       ErrLog(<<"received unknown message type, ignoring it");
-      return;
+   }
+   else
+   {
+      onMessagePayload(boost::beast::buffers_to_string(mReadBuffer.data()));
    }
 
-   const std::string& m = msg->get_payload();
+   mReadBuffer.consume(mReadBuffer.size());
+
+   if (mRunning)
+      doRead();
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onMessagePayload(const std::string& m)
+{
    DebugLog(<<"received a message: " << m.c_str());
 
    json::Object message;
@@ -129,7 +275,6 @@ KurentoConnection::onMessage(client* wSClient, websocketpp::connection_hdl h, cl
       // lines/offsets are zero-indexed, so bump them up by one for human presentation
       DebugLog(<<"Caught json::ParseException: " << e.what() << ", Line/offset: " << e.m_locTokenBegin.m_nLine + 1
                << '/' << e.m_locTokenBegin.m_nLineOffset + 1);
-      //m_messages.push_back("<< " + msg->get_payload());
       return;
    }
 
@@ -181,10 +326,8 @@ KurentoConnection::onMessage(client* wSClient, websocketpp::connection_hdl h, cl
          DebugLog(<<"don't know how to handle the message: " << m);
       }
    }
-
-   // FIXME
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::onResponse(const std::string& id, std::shared_ptr<KurentoResponseHandler> krh, const json::Object& message)
 {
@@ -205,7 +348,7 @@ KurentoConnection::onResponse(const std::string& id, std::shared_ptr<KurentoResp
             << " mResponseReceivedCount = " << mResponseReceivedCount);
    processSendQueue();
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::onEvent(const std::string& eventName, const json::Object& message)
 {
@@ -229,7 +372,7 @@ KurentoConnection::onEvent(const std::string& eventName, const json::Object& mes
 
    // FIXME - does every event have an Object?
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::sendMessage(const std::string& msg)
 {
@@ -238,42 +381,102 @@ KurentoConnection::sendMessage(const std::string& msg)
             << " mResponseReceivedCount = " << mResponseReceivedCount);
    processSendQueue();
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::processSendQueue()
 {
-   while(!mSendQueue.empty())
-   {
-      if(mWaitForResponse && mRequestSentCount > mResponseReceivedCount)
-      {
-         DebugLog(<<"new request to send but still waiting for response for a previous request");
-         return;
-      }
-      if(mWSClient.get_con_from_hdl(mHandle)->get_state() == websocketpp::session::state::value::open)
-      {
-         std::string& msg = mSendQueue.front();
-         websocketpp::lib::error_code ec;
-         mWSClient.send(mHandle, msg.c_str(), websocketpp::frame::opcode::text, ec);
-         if(ec)
-         {
-            ErrLog(<<"failed to send a message to Kurento"); // FIXME
-            return;
-         }
-         else
-         {
-            StackLog(<<"message sent to Kurento, removing from queue: " << msg);
-            mSendQueue.pop_front();
-            mRequestSentCount++;
-         }
-      }
-      else
-      {
-         ErrLog(<<"connection to Kurento is not in the open state, message has been queued"); // FIXME
-         return;
-      }
-   }
-}
+   if (!mConnected || mWriteInProgress || mSendQueue.empty())
+      return;
 
+   if(mWaitForResponse && mRequestSentCount > mResponseReceivedCount)
+   {
+      DebugLog(<<"new request to send but still waiting for response for a previous request");
+      return;
+   }
+
+   const std::string msg = mSendQueue.front();
+   mSendQueue.pop_front();
+
+   mWriteInProgress = true;
+   auto self = shared_from_this();
+   auto cb = [self](boost::system::error_code ec, std::size_t n) { self->onWrite(ec, n); };
+
+   if (mParsedUri.secure)
+   {
+      mWsSecure->text(true);
+      mWsSecure->async_write(net::buffer(msg), cb);
+   }
+   else
+   {
+      mWsPlain->text(true);
+      mWsPlain->async_write(net::buffer(msg), cb);
+   }
+
+   mRequestSentCount++;
+   StackLog(<<"message sent to Kurento: " << msg);
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onWrite(boost::system::error_code ec, std::size_t bytesTransferred)
+{
+   mWriteInProgress = false;
+
+   if (ec)
+   {
+      handleTransportError(ec, "write");
+      return;
+   }
+
+   // Continue the queue if there are pending messages (at most one async
+   // write in flight at a time - a Beast stream does not support concurrent
+   // writes).
+   processSendQueue();
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::handleTransportError(boost::system::error_code ec, const char* what)
+{
+   if (!mRunning)
+      return; // a deliberate shutdown is in progress, see close()
+
+   ErrLog(<<"transport error during " << what << ": " << ec.message() << ", will retry after "
+          << mRetryInterval.count() << " ms");
+
+   mConnected = false;
+   scheduleRetry();
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::scheduleRetry()
+{
+   auto self = shared_from_this();
+   mRetryTimer.expires_after(mRetryInterval);
+   mRetryTimer.async_wait([self](boost::system::error_code ec) { self->onRetryTimerExpired(ec); });
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::onRetryTimerExpired(boost::system::error_code ec)
+{
+   if (ec == net::error::operation_aborted || !mRunning)
+      return;
+
+   onRetryRequired();
+}
+//-----------------------------------------------------------------------------
+void
+KurentoConnection::close()
+{
+   mRunning = false;
+   mRetryTimer.cancel();
+
+   boost::system::error_code ec;
+   if (mParsedUri.secure && mWsSecure)
+      mWsSecure->close(websocket::close_code::normal, ec);
+   else if (mWsPlain)
+      mWsPlain->close(websocket::close_code::normal, ec);
+   // Best-effort close: any error is ignored if the transport was already down.
+}
+//-----------------------------------------------------------------------------
 std::string
 KurentoConnection::sendRequest(std::shared_ptr<KurentoResponseHandler> krh, const std::string& method, const json::Object& params)
 {
@@ -301,14 +504,14 @@ KurentoConnection::sendRequest(std::shared_ptr<KurentoResponseHandler> krh, cons
 
    return id;
 }
-
+//-----------------------------------------------------------------------------
 void
 KurentoConnection::registerObject(std::shared_ptr<KurentoResponseHandler> object)
 {
    std::shared_ptr<Object> _object = std::static_pointer_cast<Object>(object);
    mObjects[_object->getId()] = _object;
 }
-
+//-----------------------------------------------------------------------------
 // FIXME - we don't call this method from anywhere
 void
 KurentoConnection::unregisterObject(const std::string& objectId)

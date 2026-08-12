@@ -5,14 +5,24 @@
 #include <string>
 #include <map>
 
-#include <websocketpp/config/asio_no_tls.hpp>
-#include <websocketpp/server.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ssl/context.hpp>
 
 #include "KurentoConnection.hxx"
 
 namespace kurento
 {
 
+/**
+ * No longer includes websocketpp/server.hpp - in the previous version this
+ * was an unused include (a websocketpp::server was never instantiated here,
+ * only a client), and this dead include was itself the source of several of
+ * the compile errors seen against a modern Boost (the template code in
+ * server_endpoint.hpp is not valid under C++20 with recent GCC, independent
+ * of the underlying io_service incompatibility). websocketpp/client.hpp is
+ * also no longer included: the WS/WSS transport is now Boost.Beast,
+ * encapsulated entirely inside KurentoConnection.
+ */
 class KurentoManager
 {
    public:
@@ -28,8 +38,8 @@ class KurentoManager
    private:
       std::chrono::milliseconds mTimeout;
       std::chrono::milliseconds mRetryInterval;
-      websocketpp::lib::asio::io_service mAsio;
-      websocketpp::client<websocketpp::config::asio_client> mWSClient;
+      boost::asio::io_context mIoc;
+      boost::asio::ssl::context mSslCtx;
 
       std::map<std::string, KurentoConnection::ptr> mConnections;
 
