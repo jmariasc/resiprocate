@@ -2,6 +2,7 @@
 #include <openssl/ssl.h>
 
 #include <boost/asio/connect.hpp>
+#include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/beast/core/buffers_to_string.hpp>
 
 #include "cajun/json/writer.h"
@@ -120,6 +121,16 @@ KurentoConnection::onRetryRequired()
          boost::system::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
          ErrLog(<<"failed to set SNI hostname: " << ec.message());
       }
+
+      // Hostname verification. ssl::verify_peer (set once, on the ssl::context
+      // shared across all connections - see KurentoManager.cxx) only checks
+      // that the peer certificate chains to a trusted CA; it does NOT check
+      // that the certificate's CN/SAN matches the host we asked to connect
+      // to. Without this callback, wss:// would accept any certificate
+      // issued by any CA in the system trust store, for any domain -
+      // opening the door to a MITM with a validly-signed certificate for a
+      // different host.
+      mWsSecure->next_layer().set_verify_callback(ssl::host_name_verification(mParsedUri.host));
    }
    else
    {
@@ -394,8 +405,17 @@ KurentoConnection::processSendQueue()
       return;
    }
 
-   const std::string msg = mSendQueue.front();
-   mSendQueue.pop_front();
+   // The message stays in mSendQueue (at the front) until onWrite() confirms
+   // it was actually sent. async_write() only requires the buffer it was
+   // given to remain valid until the completion handler runs - this
+   // reference into the deque (stable as long as we don't pop it) is what
+   // backs net::buffer() below, not a local copy that would go out of scope
+   // while the write is still in flight (which is what the previous version
+   // of this method did: `const std::string msg = mSendQueue.front();`
+   // followed by `net::buffer(msg)` handed to an async operation, with `msg`
+   // destroyed as soon as this function returned - a use-after-free on every
+   // write).
+   const std::string& msg = mSendQueue.front();
 
    mWriteInProgress = true;
    auto self = shared_from_this();
@@ -412,20 +432,48 @@ KurentoConnection::processSendQueue()
       mWsPlain->async_write(net::buffer(msg), cb);
    }
 
-   mRequestSentCount++;
    StackLog(<<"message sent to Kurento: " << msg);
 }
 //-----------------------------------------------------------------------------
 void
 KurentoConnection::onWrite(boost::system::error_code ec, std::size_t bytesTransferred)
 {
+   if (ec == net::error::operation_aborted)
+      return; // A stale completion from a write issued on a stream we have
+              // since torn down ourselves (onRetryRequired()/close()). By the
+              // time this fires, mWriteInProgress/mSendQueue may already
+              // belong to a newer connection attempt with its own write
+              // genuinely in flight - touching either here (even just
+              // resetting mWriteInProgress to false) would let that new
+              // write race with a second one triggered by whatever queued a
+              // message in the meantime, and Beast does not support
+              // concurrent writes on the same stream. The transition back to
+              // mWriteInProgress = false for a torn-down stream is already
+              // handled explicitly by onRetryRequired(); this stale
+              // completion has nothing left to do.
+
    mWriteInProgress = false;
 
    if (ec)
    {
+      // The message is still at the front of mSendQueue: leave it there so it
+      // gets retried once a new connection is established (onWsHandshake()
+      // calls processSendQueue() again after a successful reconnect). The
+      // previous version of this method popped the message and incremented
+      // mRequestSentCount unconditionally *before* the write result was
+      // known, so a failed write silently dropped the message forever while
+      // still counting it as sent - with mWaitForResponse true (the
+      // default), that permanently desynchronised mRequestSentCount from
+      // mResponseReceivedCount and blocked all further sends.
       handleTransportError(ec, "write");
       return;
    }
+
+   // Only now, with the write actually confirmed, is it safe to drop the
+   // message and count it as sent.
+   if (!mSendQueue.empty())
+      mSendQueue.pop_front();
+   mRequestSentCount++;
 
    // Continue the queue if there are pending messages (at most one async
    // write in flight at a time - a Beast stream does not support concurrent
@@ -436,6 +484,17 @@ KurentoConnection::onWrite(boost::system::error_code ec, std::size_t bytesTransf
 void
 KurentoConnection::handleTransportError(boost::system::error_code ec, const char* what)
 {
+   if (ec == net::error::operation_aborted)
+      return; // A stale completion from a stream we already tore down
+              // ourselves (onRetryRequired() destroys mWsPlain/mWsSecure to
+              // rebuild them on every reconnect attempt, which aborts any
+              // operation - typically a pending doRead() - still in flight on
+              // the old stream). This is not a real transport failure: acting
+              // on it here (scheduling yet another retry) could tear down a
+              // new connection that was established in the meantime, since
+              // this aborted completion can be delivered after the new
+              // connection attempt has already succeeded.
+
    if (!mRunning)
       return; // a deliberate shutdown is in progress, see close()
 
