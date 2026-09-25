@@ -7,6 +7,8 @@
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include <openssl/ossl_typ.h>
+#include <openssl/bn.h>
+#include <openssl/rsa.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include "resip/stack/X509Contents.hxx"
@@ -35,8 +37,14 @@ int main()
  
    Random::initialize();
 
-   rsa = RSA_generate_key(1024, RSA_F4, NULL, NULL);
-   resip_assert(rsa);    // couldn't make key pair
+   {
+      BIGNUM* e = BN_new();
+      BN_set_word(e, RSA_F4);
+      rsa = RSA_new();
+      resip_assert(rsa);
+      resip_assert(RSA_generate_key_ex(rsa, 1024, e, NULL));
+      BN_free(e);
+   }
 
    EVP_PKEY_assign_RSA(privkey, rsa);
    resip_assert(privkey);
@@ -95,7 +103,9 @@ int makeSelfCert(X509 **cert, EVP_PKEY *privkey)   // should include a Uri type 
 
   //  RAND_bytes((char *) serial , 4);
   //serial = 1;
-  serial = Random::getCryptoRandom();  // get an int worth of randomness
+  // RFC 5280 4.1.2.2 wants a positive serial, and getCryptoRandom() fills a
+  // whole int from RAND_bytes, so it is negative about half the time.
+  serial = Random::getCryptoRandom() & 0x7FFFFFFF;
   ASN1_INTEGER_set(X509_get_serialNumber(selfcert),serial);
 
   X509_NAME_add_entry_by_txt( subject, "O",  MBSTRING_UTF8, (unsigned char *) domain.data(), domain.size(), -1, 0);
@@ -104,8 +114,8 @@ int makeSelfCert(X509 **cert, EVP_PKEY *privkey)   // should include a Uri type 
   X509_set_issuer_name(selfcert, subject);
   X509_set_subject_name(selfcert, subject);
 
-  X509_gmtime_adj(X509_get_notBefore(selfcert),0);
-  X509_gmtime_adj(X509_get_notAfter(selfcert), duration);
+  X509_gmtime_adj(X509_getm_notBefore(selfcert),0);
+  X509_gmtime_adj(X509_getm_notAfter(selfcert), duration);
 
   X509_set_pubkey(selfcert, privkey);
 
@@ -130,7 +140,8 @@ int makeSelfCert(X509 **cert, EVP_PKEY *privkey)   // should include a Uri type 
  * The Vovida Software License, Version 1.0 
  * 
  * Copyright (c) 2000-2005 Vovida Networks, Inc.  All rights reserved.
- * 
+ * Copyright (c) 2026 SIP Spectrum, Inc. https://www.sipspectrum.com
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
