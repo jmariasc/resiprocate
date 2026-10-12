@@ -26,6 +26,7 @@
 #include "rutil/Socket.hxx"
 #include "rutil/Timer.hxx"
 #include "rutil/ParseBuffer.hxx"
+#include "rutil/DnsUtil.hxx"
 #include "rutil/FileSystem.hxx"
 #include "rutil/WinLeakCheck.hxx"
 
@@ -410,24 +411,43 @@ Security::createDomainCtx(const SSL_METHOD* method, const Data& domain, const Da
    SSL_CTX* ctx = SSL_CTX_new(method);
    resip_assert(ctx);
 
-   X509_STORE* x509Store = X509_STORE_new();
-   resip_assert(x509Store);
+   // Share the root certificate store with Security's own SSL_CTXs (every root
+   // certificate is added to it), so roots added after this transport was
+   // created are trusted too.  set1 takes a reference of its own.
+   SSL_CTX_set1_cert_store(ctx, mRootSslCerts);
 
-   // Load root certs into store
-   X509List::iterator it;
-   for(it = mRootCerts.begin(); it != mRootCerts.end(); it++)
+   try
    {
-      X509_STORE_add_cert(x509Store,*it);
+      updateDomainCtx(ctx, domain, certificateFilename, privateKeyFilename, privateKeyPassPhrase);
    }
-   SSL_CTX_set_cert_store(ctx, x509Store);
-
-   updateDomainCtx(ctx, domain, certificateFilename, privateKeyFilename, privateKeyPassPhrase);
+   catch(...)
+   {
+      SSL_CTX_free(ctx);
+      throw;
+   }
 
    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER|SSL_VERIFY_CLIENT_ONCE, verifyCallback);
    SSL_CTX_set_cipher_list(ctx, mCipherList.cipherList().c_str());
    setDHParams(ctx);
    SSL_CTX_set_options(ctx, BaseSecurity::OpenSSLCTXSetOptions);
    SSL_CTX_clear_options(ctx, BaseSecurity::OpenSSLCTXClearOptions);
+
+   // A server that asks for client certificates (SSL_VERIFY_PEER) needs a
+   // session id context, or OpenSSL fails the handshake of any client that
+   // tries to resume a session (SSL_R_SESSION_ID_CONTEXT_UNINITIALIZED)
+   // instead of doing a full one.  Derived from the domain so sessions are
+   // only resumed in the context they were set up in.
+   const Data sessionContext(Data("resip:") + domain);
+   unsigned char sessionIdContext[EVP_MAX_MD_SIZE];
+   unsigned int sessionIdContextLength = 0;
+   if(EVP_Digest(sessionContext.data(), sessionContext.size(), sessionIdContext,
+                 &sessionIdContextLength, EVP_sha256(), nullptr) != 1 ||
+      sessionIdContextLength > SSL_MAX_SID_CTX_LENGTH ||
+      SSL_CTX_set_session_id_context(ctx, sessionIdContext, sessionIdContextLength) != 1)
+   {
+      WarningLog(<< "Failed to set the TLS session id context for domain " << domain
+                 << ", clients verified with a certificate can't resume sessions");
+   }
 
    return ctx;
 }
@@ -448,7 +468,6 @@ Security::updateDomainCtx(SSL_CTX* ctx, const Data& domain, const Data& certific
       if(SSL_CTX_use_certificate_chain_file(ctx, certFilename.c_str()) != 1)
       {
          ErrLog (<< "Error reading domain chain file " << certFilename);
-         SSL_CTX_free(ctx);
          throw BaseSecurity::Exception("Failed opening PEM chain file", __FILE__,__LINE__);
       }
 
@@ -468,13 +487,11 @@ Security::updateDomainCtx(SSL_CTX* ctx, const Data& domain, const Data& certific
       if(SSL_CTX_use_PrivateKey_file(ctx, keyFilename.c_str(), SSL_FILETYPE_PEM) != 1)
       {
          ErrLog (<< "Error reading domain private key file " << keyFilename);
-         SSL_CTX_free(ctx);
          throw BaseSecurity::Exception("Failed opening PEM private key file", __FILE__,__LINE__);
       }
       if (!SSL_CTX_check_private_key(ctx))
       {
          ErrLog (<< "Invalid domain private key from file: " << keyFilename);
-         SSL_CTX_free(ctx);
          throw BaseSecurity::Exception("Invalid domain private key", __FILE__,__LINE__);
       }
 
@@ -2751,23 +2768,27 @@ BaseSecurity::getCertNames(X509 *cert, std::list<PeerName> &peerNames,
       if(gen->type == GEN_URI) 
       {
          ASN1_IA5STRING* asn = gen->d.uniformResourceIdentifier;
-         Uri uri(Data(ASN1_STRING_get0_data(asn), ASN1_STRING_length(asn)));
+         Data uriString(ASN1_STRING_get0_data(asn), ASN1_STRING_length(asn));
          try
          {
+             // The Uri constructor parses, so it has to be inside the try: an
+             // exception escaping from here would break the TLS handshake code
+             Uri uri(uriString);
              PeerName peerName(SubjectAltName, uri.host());
              peerNames.push_back(peerName);
              InfoLog(<< "subjectAltName of TLS session cert contains URI <" << uri << ">" );
          }
          catch (...)
          {
-             InfoLog(<< "subjectAltName of TLS session cert contains unparsable URI");
+             InfoLog(<< "subjectAltName of TLS session cert contains unparsable URI <" << uriString << ">, ignoring it");
          }
       }
    }
    sk_GENERAL_NAME_pop_free(gens, GENERAL_NAME_free);
 
-   // If there are no peer names from the subjectAltName, then use the commonName
-   if(peerNames.empty())
+   // If there are no peer names from the subjectAltName, then use the commonName,
+   // if the certificate has one: an empty name would match an empty target domain
+   if(peerNames.empty() && !commonName.empty())
    {
       PeerName peerName(CommonName, commonName);
       peerNames.push_back(peerName);
@@ -2806,9 +2827,14 @@ BaseSecurity::getCertName(X509 *cert)
 /**
    Applies the certificate and domain name matching rules
 */
-int 
+int
 BaseSecurity::matchHostName(const Data& certificateName, const Data& domainName)
 {
+   // An empty name never identifies anyone, even when both are empty
+   if(certificateName.empty() || domainName.empty())
+   {
+      return 0;
+   }
    if(mAllowWildcardCertificates)
       return matchHostNameWithWildcards(certificateName,domainName);
    return isEqualNoCase(certificateName,domainName);
@@ -2994,41 +3020,42 @@ BaseSecurity::parseOpenSSLCTXOption(const Data& optionName)
    throw invalid_argument(error.c_str());
 }
 /**
-   Does a wildcard match on domain and certificate name
-   @todo    looks incomplete, make better
+   Matches a certificate name, which may hold a wildcard, against the domain
+   name we connected to, following RFC 6125 section 6.4.3: the wildcard has to
+   be the whole left-most label ("*.example.com"), it stands for exactly one
+   non-empty label of the domain name, at least two labels have to follow it,
+   and it never matches an IP address.
 */
-int 
+int
 BaseSecurity::matchHostNameWithWildcards(const Data& certificateName, const Data& domainName)
 {
-   const char *dot = NULL;
-
-   const char *certName = certificateName.c_str();
-   if(certName == NULL)
-      return 0;
-
-   const char *domName = domainName.c_str();
-   if(domName == NULL)
-      return 0;
-
-   dot = strchr(domName, '.');
-   if (dot == NULL)
+   if(isEqualNoCase(certificateName, domainName))
    {
-      char *pnt = (char *)strchr(certName, '.'); // bad
-      /* hostname is not fully-qualified; unqualify the certName. */
-      if (pnt != NULL) 
-      {
-         *pnt = '\0';
-      }
+      return 1;
    }
-   else 
+
+   static const Data wildcardLabel("*.");
+   if(!certificateName.prefix(wildcardLabel) || DnsUtil::isIpAddress(domainName))
    {
-      if (strncmp(certName, "*.", 2) == 0) 
-      {
-         domName = dot + 1;
-         certName += 2;
-      }
+      return 0;
    }
-   return !strcasecmp(certName, domName);
+
+   // What the wildcard's label is followed by has to be two labels or more,
+   // otherwise "*.com" would match every host in a top-level domain
+   const Data certificateBase = certificateName.substr(wildcardLabel.size());
+   const Data::size_type baseDot = certificateBase.find(".");
+   if(baseDot == Data::npos || baseDot == 0 || baseDot + 1 == certificateBase.size())
+   {
+      return 0;
+   }
+
+   // The wildcard stands for the domain name's first label, which can't be empty
+   const Data::size_type dot = domainName.find(".");
+   if(dot == Data::npos || dot == 0)
+   {
+      return 0;
+   }
+   return isEqualNoCase(domainName.substr(dot + 1), certificateBase);
 }
 
 bool

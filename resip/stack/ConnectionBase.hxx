@@ -11,6 +11,7 @@
 #include "resip/stack/SendData.hxx"
 #include "resip/stack/WsFrameExtractor.hxx"
 #include "resip/stack/Cookie.hxx"
+#include "resip/stack/ConnectionInfo.hxx"
 
 namespace osc
 {
@@ -105,9 +106,14 @@ class ConnectionBase
       std::unique_ptr<Data> makeWsHandshakeResponse();
       bool isUsingSecWebSocketKey();
       bool isUsingDeprecatedSecWebSocketKeys();
+      const std::shared_ptr<const ConnectionInfo>& getConnectionInfo();
    protected:
       virtual void onDoubleCRLF(){}
       virtual void onSingleCRLF(){}
+      // WebSocket control frames from the peer (RFC 6455 section 5.5); the payload of a
+      // Close is its status code and reason, if it sent any
+      virtual void onWsClose(const Data& payload){}
+      virtual void onWsPing(const Data& payload){}
       Transport* mTransport;
       Tuple mWho;
       TransportFailure::FailureReason mFailureReason;
@@ -132,6 +138,11 @@ class ConnectionBase
       ConnState mConnState;
       MsgHeaderScanner mMsgHeaderScanner;
 
+      // TLS/WebSocket details given to every message received on this
+      // connection; built when the first message arrives
+      std::shared_ptr<const ConnectionInfo> mConnectionInfo;
+      bool mConnectionInfoBuilt = false;
+
       static size_t messageSizeMax;
 
    public:
@@ -148,6 +159,7 @@ operator<<(EncodeStream& strm, const resip::ConnectionBase& c);
 /* ====================================================================
  * The Vovida Software License, Version 1.0 
  * 
+ * Copyright (c) 2026 SIP Spectrum, Inc. https://www.sipspectrum.com
  * Copyright (c) 2000
  * 
  * Redistribution and use in source and binary forms, with or without
